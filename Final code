@@ -1,0 +1,333 @@
+#define F_CPU 16000000UL
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+/* ---------------- Assignment constants ---------------- */
+#define D1_CM 14
+#define D2_CM 42
+
+#define SAMPLE_PERIOD_MS      50
+#define BLINK_HALF_PERIOD_MS  500
+
+/* ---------------- UART ---------------- */
+#define BAUD   9600
+#define MYUBRR (F_CPU/16/BAUD - 1)
+
+/* ---------------- Sensor mode ---------------- */
+#define IR_MODE 0
+#define US_MODE 1
+uint8_t sensor_mode = IR_MODE;  // set to US_MODE when testing ultrasonic
+
+/* ---------------- IR calibration (example fit) ---------------- */
+#define CALIB_K 11844
+#define CALIB_C 76
+
+/* IR ADC channel (ADC2 = Arduino A2) */
+#define IR_ADC_CH 2
+
+/* ---------------- Ultrasonic pins ----------------
+   TRIG on PB3, ECHO on PD2 */
+#define US_TRIG_MASK (1 << PB3)
+#define US_ECHO_MASK (1 << PD2)
+
+/* Arduino "L" LED is PB5 (D13) */
+#define YELLOW_LED_MASK (1 << PB5)
+
+/* ---------------- Timebase (millis) ---------------- */
+volatile uint32_t g_ms = 0;
+
+/* Timer0 Compare Match A interrupt -> 1 ms tick */
+ISR(TIMER0_COMPA_vect)
+{
+    g_ms++;
+}
+
+static inline uint32_t sys_millis(void)
+{
+    uint32_t t;
+    uint8_t s = SREG;
+    cli();
+    t = g_ms;
+    SREG = s;
+    return t;
+}
+
+/* Timer0 CTC @1ms:
+   16MHz / 64 = 250kHz -> 1ms = 250 ticks -> OCR0A = 249 */
+static inline void Timer0_init_1ms(void)
+{
+    TCCR0A = (1 << WGM01);              // CTC
+    TCCR0B = (1 << CS01) | (1 << CS00); // prescaler 64
+    OCR0A  = 249;
+    TIMSK0 = (1 << OCIE0A);
+}
+
+/* ---------------- PWM on D3 (PD3 / OC2B / Timer2) ---------------- */
+static inline void PWM_D3_init(void)
+{
+    DDRD |= (1 << DDD3); // PD3 output
+
+    // Fast PWM, TOP=0xFF, non-inverting on OC2B, prescaler 64
+    TCCR2A = (1 << COM2B1) | (1 << WGM21) | (1 << WGM20);
+    TCCR2B = (1 << CS22); // prescaler 64
+    OCR2B  = 0;
+}
+
+static inline void PWM_D3_set(uint8_t duty)
+{
+    OCR2B = duty; // 0..255
+}
+
+/* Use distance with 2 decimals (cm * 100) for mapping */
+static inline uint8_t pwm_from_distance_x100(uint32_t dist_x100)
+{
+    uint32_t d1 = (uint32_t)D1_CM * 100UL;
+    uint32_t d2 = (uint32_t)D2_CM * 100UL;
+
+    if (dist_x100 <= d1) return 0;
+    if (dist_x100 >= d2) return 255;
+
+    return (uint8_t)((255UL * (dist_x100 - d1)) / (d2 - d1));
+}
+
+/* ---------------- Yellow LED (PB5) ---------------- */
+static inline void YellowLED_init(void)
+{
+    DDRB  |= YELLOW_LED_MASK;
+    PORTB &= ~YELLOW_LED_MASK;
+}
+
+static inline void YellowLED_off(void)
+{
+    PORTB &= ~YELLOW_LED_MASK;
+}
+
+static inline void YellowLED_toggle(void)
+{
+    PINB = YELLOW_LED_MASK; // hardware toggle
+}
+
+/* ---------------- UART helpers ---------------- */
+static inline void UART_init(uint16_t ubrr)
+{
+    UBRR0H = (uint8_t)(ubrr >> 8);
+    UBRR0L = (uint8_t)(ubrr);
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0);
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00); // 8N1
+}
+
+static inline void UART_transmit(uint8_t data)
+{
+    while (!(UCSR0A & (1 << UDRE0))) { }
+    UDR0 = data;
+}
+
+static inline void UART_printString(const char* str)
+{
+    while (*str) UART_transmit((uint8_t)*str++);
+}
+
+static inline void UART_printU16(uint16_t num)
+{
+    char buf[6];
+    utoa(num, buf, 10);
+    UART_printString(buf);
+}
+
+static inline void UART_printU32(uint32_t num)
+{
+    char buf[11];
+    ultoa(num, buf, 10);
+    UART_printString(buf);
+}
+
+/* Print distance in cm with 2 decimals from cm*100 */
+static inline void UART_printDistance_x100(uint32_t dist_x100)
+{
+    uint16_t integer_part = (uint16_t)(dist_x100 / 100UL);
+    uint16_t decimal_part = (uint16_t)(dist_x100 % 100UL);
+
+    UART_printU16(integer_part);
+    UART_transmit('.');
+    if (decimal_part < 10) UART_transmit('0');
+    UART_printU16(decimal_part);
+}
+
+/* ---------------- ADC (IR) ----------------
+   External AREF selected (REFS=00).
+   With Vref=2.0V provided on AREF, ADC=1023 -> 2.0V. */
+static inline void ADC_init(void)
+{
+    ADMUX  = 0x00; // External AREF, right adjust
+    ADCSRA = (1 << ADEN) |
+             (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // prescaler 128
+}
+
+static inline uint16_t ADC_read(uint8_t channel)
+{
+    channel &= 0x07;
+    ADMUX = (ADMUX & 0xF8) | channel;
+
+    ADCSRA |= (1 << ADSC);
+    while (ADCSRA & (1 << ADSC)) { }
+
+    return ADC;
+}
+
+/* IR conversion returning cm*100 (2 decimals), no float */
+static inline uint32_t IR_adc_to_distance_x100(uint16_t raw_adc)
+{
+    if (raw_adc <= (uint16_t)(CALIB_C + 1)) return 8000; // 80.00 cm
+    if (raw_adc > 1000)                     return 900;  // 9.00 cm
+
+    // distance_cm = K / (adc - C)
+    // distance_x100 = (K*100) / (adc - C)
+    return (uint32_t)(CALIB_K * 100UL) / (uint32_t)(raw_adc - CALIB_C);
+}
+
+/* ---------------- Ultrasonic (Timer1) ---------------- */
+static inline void Ultrasonic_init(void)
+{
+    DDRB |= US_TRIG_MASK;   // PB3 TRIG output
+    DDRD &= ~US_ECHO_MASK;  // PD2 ECHO input
+
+    // Timer1 prescaler 8 => tick = 0.5us
+    TCCR1A = 0;
+    TCCR1B = (1 << CS11);
+}
+
+/* Returns distance in cm*100, writes raw timer ticks to *raw_ticks */
+static inline uint32_t Measure_Ultrasonic_Distance_x100(uint16_t *raw_ticks)
+{
+    // Trigger 10us pulse
+    PORTB &= ~US_TRIG_MASK;
+    _delay_us(2);
+    PORTB |= US_TRIG_MASK;
+    _delay_us(10);
+    PORTB &= ~US_TRIG_MASK;
+
+    // Wait for ECHO high (timeout)
+    int32_t timeout = 60000;
+    while (!(PIND & US_ECHO_MASK)) {
+        if (--timeout == 0) {
+            *raw_ticks = 0;
+            return 0;
+        }
+    }
+
+    uint8_t sreg = SREG;
+    cli();
+
+    TCNT1 = 0;
+
+    // Measure width while ECHO high, with safety cap
+    while (PIND & US_ECHO_MASK) {
+        if (TCNT1 > 60000) {
+            uint16_t t = TCNT1;
+            SREG = sreg;
+            *raw_ticks = t;
+            return 40000; // 400.00 cm (cap)
+        }
+    }
+
+    uint16_t ticks = TCNT1;
+    SREG = sreg;
+
+    *raw_ticks = ticks;
+
+    // ticks are 0.5us each => time_us = ticks/2
+    // distance_cm = time_us / 58 = (ticks/2)/58 = ticks/116
+    // distance_x100 = (ticks * 100) / 116
+    return (uint32_t)(ticks * 100UL) / 116UL;
+}
+
+/* ---------------- Setup / Loop ---------------- */
+static inline void setup(void)
+{
+    UART_init((uint16_t)MYUBRR);
+    ADC_init();
+    Ultrasonic_init();
+
+    PWM_D3_init();        // D3 brightness (OC2B)
+    YellowLED_init();     // PB5 blink (L)
+    Timer0_init_1ms();    // millis timebase
+
+    sei();
+
+    UART_printString("System Initialized.\r\n");
+}
+
+static inline void loop(void)
+{
+    static uint32_t last_sample_ms = 0;
+    static uint32_t last_blink_ms  = 0;
+    static uint8_t  outside_range  = 0;
+
+    uint32_t now = sys_millis();
+
+    if (now - last_sample_ms >= SAMPLE_PERIOD_MS) {
+        last_sample_ms = now;
+
+        if (sensor_mode == IR_MODE) {
+            uint16_t raw_adc    = ADC_read(IR_ADC_CH);
+            uint32_t dist_x100  = IR_adc_to_distance_x100(raw_adc);
+            uint8_t  duty       = pwm_from_distance_x100(dist_x100);
+
+            PWM_D3_set(duty);
+
+            UART_printString("IR | ADC=");
+            UART_printU16(raw_adc);
+            UART_printString(" | Dist=");
+            UART_printDistance_x100(dist_x100);
+            UART_printString(" cm | PWM=");
+            UART_printU16(duty);
+            UART_printString("\r\n");
+
+            // range check uses cm*100
+            outside_range = (dist_x100 < (uint32_t)D1_CM * 100UL) ||
+                            (dist_x100 > (uint32_t)D2_CM * 100UL);
+
+        } else { // US_MODE
+            uint16_t raw_ticks  = 0;
+            uint32_t dist_x100  = Measure_Ultrasonic_Distance_x100(&raw_ticks);
+            uint8_t  duty       = pwm_from_distance_x100(dist_x100);
+
+            PWM_D3_set(duty);
+
+            UART_printString("US | ticks=");
+            UART_printU16(raw_ticks);
+            UART_printString(" | Dist=");
+            UART_printDistance_x100(dist_x100);
+            UART_printString(" cm | PWM=");
+            UART_printU16(duty);
+            UART_printString("\r\n");
+
+            outside_range = (dist_x100 < (uint32_t)D1_CM * 100UL) ||
+                            (dist_x100 > (uint32_t)D2_CM * 100UL);
+        }
+
+        // If inside range, force LED off and reset blink timing
+        if (!outside_range) {
+            YellowLED_off();
+            last_blink_ms = now;
+        }
+    }
+
+    // Blink at 1s period (toggle every 500ms) when outside range
+    if (outside_range && (now - last_blink_ms >= BLINK_HALF_PERIOD_MS)) {
+        last_blink_ms = now;
+        YellowLED_toggle();
+    }
+}
+
+int main(void)
+{
+    setup();
+    while (1) {
+        loop();
+    }
+}
