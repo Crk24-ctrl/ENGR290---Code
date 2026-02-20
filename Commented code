@@ -1,0 +1,324 @@
+#define F_CPU 16000000UL   // Arduino clock frequency (16 MHz)
+
+/* ===== Standard AVR libraries ===== */
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+/* =====================================================
+   Assignment constants:
+   D1 and D2 define the brightness control range
+   ===================================================== */
+#define D1_CM 14
+#define D2_CM 42
+
+/* Sampling and blinking timing */
+#define SAMPLE_PERIOD_MS      50     // Distance measurement every 50 ms
+#define BLINK_HALF_PERIOD_MS  500    // 1 second blinking period
+
+/* =====================================================
+   UART configuration for serial monitoring
+   ===================================================== */
+#define BAUD   9600
+#define MYUBRR (F_CPU/16/BAUD - 1)
+
+/* =====================================================
+   Sensor selection (only one sensor active at a time)
+   ===================================================== */
+#define IR_MODE 0
+#define US_MODE 1
+uint8_t sensor_mode = IR_MODE;  // Change to US_MODE to test ultrasonic
+
+/* =====================================================
+   IR sensor calibration constants
+   These come from experimental fitting of the GP2Y0A21
+   ===================================================== */
+#define CALIB_K 11844
+#define CALIB_C 76
+
+/* IR connected to ADC2 (Arduino A2) */
+#define IR_ADC_CH 2
+
+/* =====================================================
+   Ultrasonic sensor pins:
+   TRIG = PB3, ECHO = PD2
+   ===================================================== */
+#define US_TRIG_MASK (1 << PB3)
+#define US_ECHO_MASK (1 << PD2)
+
+/* Arduino built-in yellow LED ("L") on PB5 */
+#define YELLOW_LED_MASK (1 << PB5)
+
+/* =====================================================
+   System time base (millisecond counter)
+   Used for periodic sampling and blinking
+   ===================================================== */
+volatile uint32_t g_ms = 0;
+
+/* Interrupt triggered every 1 ms */
+ISR(TIMER0_COMPA_vect)
+{
+    g_ms++;   // Increment system time
+}
+
+/* Safely read millisecond counter */
+static inline uint32_t sys_millis(void)
+{
+    uint32_t t;
+    uint8_t s = SREG;
+    cli();
+    t = g_ms;
+    SREG = s;
+    return t;
+}
+
+/* Timer0 configured to generate interrupt every 1 ms */
+static inline void Timer0_init_1ms(void)
+{
+    TCCR0A = (1 << WGM01);              // CTC mode
+    TCCR0B = (1 << CS01) | (1 << CS00); // Prescaler 64
+    OCR0A  = 249;                       // Compare value for 1 ms
+    TIMSK0 = (1 << OCIE0A);             // Enable interrupt
+}
+
+/* =====================================================
+   PWM configuration on D3 (OC2B)
+   Controls brightness of LED connected to D3
+   ===================================================== */
+static inline void PWM_D3_init(void)
+{
+    DDRD |= (1 << DDD3);  // Set D3 as output
+
+    /* Fast PWM mode using Timer2 */
+    TCCR2A = (1 << COM2B1) | (1 << WGM21) | (1 << WGM20);
+    TCCR2B = (1 << CS22); // Prescaler 64
+
+    OCR2B  = 0;           // Initial duty cycle
+}
+
+/* Set PWM duty cycle (0 to 255) */
+static inline void PWM_D3_set(uint8_t duty)
+{
+    OCR2B = duty;
+}
+
+/* =====================================================
+   Assignment requirement:
+   Control LED brightness based on distance
+   - d ≤ 14 cm  → 0%
+   - d ≥ 42 cm  → 100%
+   - Linear in between
+   ===================================================== */
+static inline uint8_t pwm_from_distance_x100(uint32_t dist_x100)
+{
+    uint32_t d1 = (uint32_t)D1_CM * 100UL;
+    uint32_t d2 = (uint32_t)D2_CM * 100UL;
+
+    if (dist_x100 <= d1) return 0;
+    if (dist_x100 >= d2) return 255;
+
+    /* Linear interpolation */
+    return (uint8_t)((255UL * (dist_x100 - d1)) / (d2 - d1));
+}
+
+/* =====================================================
+   Yellow LED control (used to indicate out-of-range)
+   ===================================================== */
+static inline void YellowLED_init(void)
+{
+    DDRB  |= YELLOW_LED_MASK;
+    PORTB &= ~YELLOW_LED_MASK;
+}
+
+static inline void YellowLED_off(void)
+{
+    PORTB &= ~YELLOW_LED_MASK;
+}
+
+static inline void YellowLED_toggle(void)
+{
+    PINB = YELLOW_LED_MASK; // Hardware toggle
+}
+
+/* =====================================================
+   UART helper functions for debugging
+   ===================================================== */
+static inline void UART_init(uint16_t ubrr)
+{
+    UBRR0H = (uint8_t)(ubrr >> 8);
+    UBRR0L = (uint8_t)(ubrr);
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0);
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00); // 8N1 format
+}
+
+static inline void UART_transmit(uint8_t data)
+{
+    while (!(UCSR0A & (1 << UDRE0)));
+    UDR0 = data;
+}
+
+static inline void UART_printString(const char* str)
+{
+    while (*str) UART_transmit(*str++);
+}
+
+/* Print integer values */
+static inline void UART_printU16(uint16_t num)
+{
+    char buf[6];
+    utoa(num, buf, 10);
+    UART_printString(buf);
+}
+
+/* Print distance with 2 decimal precision */
+static inline void UART_printDistance_x100(uint32_t dist_x100)
+{
+    uint16_t integer = dist_x100 / 100;
+    uint16_t decimal = dist_x100 % 100;
+
+    UART_printU16(integer);
+    UART_transmit('.');
+    if (decimal < 10) UART_transmit('0');
+    UART_printU16(decimal);
+}
+
+/* =====================================================
+   ADC configuration for IR sensor
+   External reference used (AREF = 2V)
+   ===================================================== */
+static inline void ADC_init(void)
+{
+    ADMUX  = 0x00;
+    ADCSRA = (1 << ADEN) |
+             (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+}
+
+static inline uint16_t ADC_read(uint8_t channel)
+{
+    channel &= 0x07;
+    ADMUX = (ADMUX & 0xF8) | channel;
+
+    ADCSRA |= (1 << ADSC);
+    while (ADCSRA & (1 << ADSC));
+
+    return ADC;
+}
+
+/* Convert IR ADC reading to distance in cm × 100 */
+static inline uint32_t IR_adc_to_distance_x100(uint16_t raw_adc)
+{
+    if (raw_adc <= CALIB_C + 1) return 8000;
+    if (raw_adc > 1000) return 900;
+
+    return (uint32_t)(CALIB_K * 100UL) / (raw_adc - CALIB_C);
+}
+
+/* =====================================================
+   Ultrasonic sensor using Timer1 to measure echo pulse
+   ===================================================== */
+static inline void Ultrasonic_init(void)
+{
+    DDRB |= US_TRIG_MASK;
+    DDRD &= ~US_ECHO_MASK;
+
+    TCCR1A = 0;
+    TCCR1B = (1 << CS11);  // Prescaler 8 (0.5 µs resolution)
+}
+
+/* Measure ultrasonic pulse and return distance */
+static inline uint32_t Measure_Ultrasonic_Distance_x100(uint16_t *raw_ticks)
+{
+    PORTB &= ~US_TRIG_MASK;
+    _delay_us(2);
+    PORTB |= US_TRIG_MASK;
+    _delay_us(10);
+    PORTB &= ~US_TRIG_MASK;
+
+    while (!(PIND & US_ECHO_MASK));
+
+    TCNT1 = 0;
+    while (PIND & US_ECHO_MASK);
+
+    uint16_t ticks = TCNT1;
+    *raw_ticks = ticks;
+
+    return (uint32_t)(ticks * 100UL) / 116UL;
+}
+
+/* =====================================================
+   Setup function: initialize all hardware
+   ===================================================== */
+static inline void setup(void)
+{
+    UART_init((uint16_t)MYUBRR);
+    ADC_init();
+    Ultrasonic_init();
+
+    PWM_D3_init();
+    YellowLED_init();
+    Timer0_init_1ms();
+
+    sei();
+}
+
+/* =====================================================
+   Main loop:
+   - Measure distance
+   - Control brightness
+   - Blink LED if outside range
+   ===================================================== */
+static inline void loop(void)
+{
+    static uint32_t last_sample = 0;
+    static uint32_t last_blink  = 0;
+    static uint8_t  outside     = 0;
+
+    uint32_t now = sys_millis();
+
+    if (now - last_sample >= SAMPLE_PERIOD_MS)
+    {
+        last_sample = now;
+
+        uint32_t dist_x100;
+        uint16_t raw_val;
+
+        if (sensor_mode == IR_MODE)
+        {
+            raw_val = ADC_read(IR_ADC_CH);
+            dist_x100 = IR_adc_to_distance_x100(raw_val);
+        }
+        else
+        {
+            dist_x100 = Measure_Ultrasonic_Distance_x100(&raw_val);
+        }
+
+        uint8_t duty = pwm_from_distance_x100(dist_x100);
+        PWM_D3_set(duty);
+
+        outside = (dist_x100 < D1_CM*100UL) ||
+                  (dist_x100 > D2_CM*100UL);
+
+        if (!outside)
+        {
+            YellowLED_off();
+            last_blink = now;
+        }
+    }
+
+    if (outside && (now - last_blink >= BLINK_HALF_PERIOD_MS))
+    {
+        last_blink = now;
+        YellowLED_toggle();
+    }
+}
+
+int main(void)
+{
+    setup();
+    while (1)
+    {
+        loop();
+    }
+}
