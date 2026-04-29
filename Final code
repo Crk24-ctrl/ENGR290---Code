@@ -1,333 +1,668 @@
-#define F_CPU 16000000UL
-
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <util/delay.h>
+#include <util/twi.h>
 #include <stdint.h>
 #include <stdlib.h>
 
-/* ---------------- Assignment constants ---------------- */
-#define D1_CM 14
-#define D2_CM 42
+#ifndef F_CPU
+#define F_CPU 16000000UL
+#endif
 
-#define SAMPLE_PERIOD_MS      50
-#define BLINK_HALF_PERIOD_MS  500
+#define LIFT_FAN_DDR   DDRD
+#define LIFT_FAN_PORT  PORTD
+#define LIFT_FAN_PIN   PD4
 
-/* ---------------- UART ---------------- */
-#define BAUD   9600
-#define MYUBRR (F_CPU/16/BAUD - 1)
+#define THRUST_FAN_DDR  DDRD
+#define THRUST_FAN_PIN  PD6
 
-/* ---------------- Sensor mode ---------------- */
-#define IR_MODE 0
-#define US_MODE 1
-uint8_t sensor_mode = IR_MODE;  // set to US_MODE when testing ultrasonic
+#define SERVO_HOME_OFFSET 0
+#define SERVO_HOME 256U
+#define SERVO_RIGHT 512U
+#define SERVO_LEFT 0U
+#define SERVO_CENTER SERVO_HOME
+#define SERVO_FULL_RIGHT SERVO_RIGHT
+#define SERVO_FULL_LEFT SERVO_LEFT
 
-/* ---------------- IR calibration (example fit) ---------------- */
-#define CALIB_K 11844
-#define CALIB_C 76
+#define US_FWD_TRIG_DDR DDRB
+#define US_FWD_TRIG_PORT PORTB
+#define US_FWD_TRIG_MASK (1 << PB3)
 
-/* IR ADC channel (ADC2 = Arduino A2) */
-#define IR_ADC_CH 2
+#define US_FWD_ECHO_DDR DDRD
+#define US_FWD_ECHO_PIN PIND
+#define US_FWD_ECHO_MASK (1 << PD2)
 
-/* ---------------- Ultrasonic pins ----------------
-   TRIG on PB3, ECHO on PD2 */
-#define US_TRIG_MASK (1 << PB3)
-#define US_ECHO_MASK (1 << PD2)
+#define US_FWD_TURN_THRESHOLD_CM 25U   
 
-/* Arduino "L" LED is PB5 (D13) */
-#define YELLOW_LED_MASK (1 << PB5)
+#define US_LEFT_TRIG_DDR DDRB
+#define US_LEFT_TRIG_PORT PORTB
+#define US_LEFT_TRIG_MASK (1 << PB5)
 
-/* ---------------- Timebase (millis) ---------------- */
-volatile uint32_t g_ms = 0;
+#define US_LEFT_ECHO_DDR DDRD
+#define US_LEFT_ECHO_PIN PIND
+#define US_LEFT_ECHO_MASK (1 << PD3)
 
-/* Timer0 Compare Match A interrupt -> 1 ms tick */
-ISR(TIMER0_COMPA_vect)
-{
-    g_ms++;
-}
+#define US_LEFT_OPEN_CM 40U  
+#define US_LEFT_CONFIRM 2U
 
-static inline uint32_t sys_millis(void)
-{
-    uint32_t t;
-    uint8_t s = SREG;
+#define US_UP_TRIG_DDR DDRB
+#define US_UP_TRIG_PORT PORTB
+#define US_UP_TRIG_MASK (1 << PB5)
+
+#define US_UP_ECHO_DDR DDRD
+#define US_UP_ECHO_PIN PIND
+#define US_UP_ECHO_MASK (1 << PD3)
+
+#define US_UP_BAR_THRESHOLD_CM 12U
+#define US_UP_CONFIRM_COUNT 3U
+#define IR_ADC_CH 0U
+#define IR_BAR_THRESHOLD 400U   
+#define IR_CONFIRM_COUNT 3U
+
+#define MPU_ADDR 0x68u
+#define REG_PWR_MGMT1 0x6Bu
+#define REG_GYRO_CONFIG 0x1Bu
+#define REG_ACCEL_CONFIG 0x1Cu
+#define REG_ACCEL_XOUT_H 0x3Bu
+#define REG_GYRO_ZOUT_H 0x47u
+
+// gyro at +-250 deg/s =131 LSB/deg mmultiply by 10 to work in centi-degrees
+#define GYRO_SIGN 1// set to -1 if turns go the wrong way on your board
+#define GYRO_DIV 1310
+#define TILT_THRESHOLD_LSB  4000// roughly 14 deg at +-2g range 
+#define CALIB_SAMPLES 200u  
+
+#define WALL_THRESHOLD_CM 45U
+#define HOVER_SPINUP_MS 2000U// wait for air  before calibrating
+#define TURN_TIMEOUT_MS 3500U// fallback if IMU doesn't confirm the turn 
+
+// thrust  down as we approach a wall
+#define THRUST_FULL_CM 85U
+#define THRUST_FULL_PCT 100U
+#define THRUST_MIN_PCT 25U
+
+// PID
+#define YAW_KP 3.0f
+#define YAW_KI 0.02f
+#define YAW_KD 1.0f
+#define YAW_MAX_CORR 100
+#define YAW_INTEGRAL_CAP 500.0f
+
+// 90 degree turn with plus ou moin 6 
+#define TURN_TARGET_CDEG 9000
+#define TURN_DONE_TOL_CDEG 600
+#define BAUD 9600UL
+#define MYUBRR  (F_CPU / 16UL / BAUD - 1UL)
+
+volatile struct {
+    uint8_t TX_new_data: 1;
+  uint8_t TX_finished: 1;
+  uint8_t TX_buffer1_empty : 1;
+   uint8_t TX_buffer2_empty : 1;
+    uint8_t RX_flag: 3;
+    uint8_t TWI_ACK: 1;} flags;
+
+volatile uint8_t TWI_status;
+volatile uint8_t TWI_byte;
+volatile uint32_t g_ms = 0UL;  
+typedef enum {
+    STATE_HOVER_UP,// lift on, waiting for air  +gyro calibraatin
+    STATE_DRIVE,       
+    STATE_TURN_LEFT,
+    STATE_TURN_RIGHT
+} hc_state_t;
+
+static hc_state_t g_state = STATE_HOVER_UP;
+ISR(TIMER0_COMPA_vect) { g_ms++; }
+static inline uint32_t sys_millis(void) //ask caline
+{  uint32_t t;
+  uint8_t s = SREG;
     cli();
-    t = g_ms;
+ t =g_ms;
     SREG = s;
-    return t;
+ return t;
 }
-
-/* Timer0 CTC @1ms:
-   16MHz / 64 = 250kHz -> 1ms = 250 ticks -> OCR0A = 249 */
-static inline void Timer0_init_1ms(void)
-{
-    TCCR0A = (1 << WGM01);              // CTC
-    TCCR0B = (1 << CS01) | (1 << CS00); // prescaler 64
-    OCR0A  = 249;
+static void timer0_init(void)
+{// fast PWM on OC0A (thrust fan) COMPARE INTERUPT
+    TCCR0A =(1 << COM0A1)| (1 << WGM01) | (1 << WGM00);
+    TCCR0B = (1 << CS01)| (1 << CS00);   // prescaler= 64
+    OCR0A= 0;
     TIMSK0 = (1 << OCIE0A);
 }
+static void delay_ms_nb(uint32_t ms)
+{uint32_t s =sys_millis();
+    while (sys_millis()- s < ms) {}}
+uint8_t TWI_start(uint8_t twi_addr, uint8_t read_write)
+{TWCR =(1 << TWINT) |(1 << TWSTA) |(1 << TWEN);
+    while (!(TWCR & (1 << TWINT)));
+    if (((TWSR & 0xF8)!= TW_START) &&((TWSR & 0xF8) != TW_REP_START)) return 1;
 
-/* ---------------- PWM on D3 (PD3 / OC2B / Timer2) ---------------- */
-static inline void PWM_D3_init(void)
+    twi_addr =(twi_addr<< 1)|(read_write &1);
+TWDR= twi_addr;
+TWCR =(1 << TWINT)| (1 << TWEN);
+    while (!(TWCR & (1 <<TWINT)));
+    if (((TWSR & 0xF8)!= TW_MT_SLA_ACK) && ((TWSR & 0xF8)!= TW_MR_SLA_ACK)) return 2;
+    return 0;
+}
+void TWI_stop(void)
+{ TWCR = (1 << TWINT) | (1 << TWEN) | (1 << TWSTO); while (TWCR & (1 << TWSTO));
+}
+uint8_t TWI_write(uint8_t tx_data)
+{ TWDR = tx_data;  TWCR = (1 << TWINT) | (1 << TWEN);
+    while (!(TWCR & (1 << TWINT)));  if ((TWSR & 0xF8) != TW_MT_DATA_ACK) return 1;
+    return 0;}
+uint8_t TWI_ack_read(void)
+{ TWCR = (1 << TWINT) |(1 << TWEN) |(1 << TWEA);
+    while (!(TWCR & (1 << TWINT)));
+   flags.TWI_ACK = 1;
+ if ((TWSR & 0xF8) != TW_MR_DATA_ACK) flags.TWI_ACK = 0;
+    return TWDR;
+}
+uint8_t TWI_nack_read(void)
+{ TWCR = (1 << TWINT) |(1 << TWEN);
+    while (!(TWCR & (1 <<TWINT)));
+    flags.TWI_ACK = 1;
+if ((TWSR & 0xF8)!= TW_MR_DATA_NACK) return flags.TWI_ACK = 0;
+    return TWDR;
+}
+uint8_t Read_Reg(uint8_t TWI_addr, uint8_t reg_addr)
 {
-    DDRD |= (1 << DDD3); // PD3 output
-
-    // Fast PWM, TOP=0xFF, non-inverting on OC2B, prescaler 64
-    TCCR2A = (1 << COM2B1) | (1 << WGM21) | (1 << WGM20);
-    TCCR2B = (1 << CS22); // prescaler 64
-    OCR2B  = 0;
+ TWI_status = TWI_start(TWI_addr, TW_WRITE); if (TWI_status) return 1;
+    TWI_status = TWI_write(reg_addr);            if (TWI_status) return 2;
+  TWI_status = TWI_start(TWI_addr, TW_READ);  if (TWI_status) return 3;
+    TWI_byte= TWI_nack_read();
+ TWI_stop();
+    if (!flags.TWI_ACK) return 4;
+    return 0;
 }
 
-static inline void PWM_D3_set(uint8_t duty)
-{
-    OCR2B = duty; // 0..255
+uint8_t Read_Reg_N(uint8_t TWI_addr, uint8_t reg_addr, uint8_t bytes, int16_t *data)
+    {uint8_t *p = (uint8_t *)data;
+TWI_status = TWI_start(TWI_addr, TW_WRITE); if (TWI_status) return 1;
+    TWI_status = TWI_write(reg_addr);if (TWI_status) return 2;
+    TWI_status = TWI_start(TWI_addr, TW_READ);  if (TWI_status) return 3;
+    for (uint8_t i = 0; i < bytes - 1; i++) {
+        *p = TWI_ack_read();
+        if (!flags.TWI_ACK) return 5; 
+        p++;
+    }
+    *p = TWI_nack_read();
+    TWI_stop();
+    if (!flags.TWI_ACK) return 4;
+    return 0;
+}
+uint8_t Write_Reg(uint8_t TWI_addr, uint8_t reg_addr, uint8_t value)
+{TWI_status = TWI_start(TWI_addr, TW_WRITE); if (TWI_status) return 1;
+    TWI_status= TWI_write(reg_addr);if (TWI_status) return 2;
+    TWI_status =TWI_write(value);if (TWI_status) return 3;
+    TWI_stop();
+    if (!flags.TWI_ACK) return 4;
+    return 0;
 }
 
-/* Use distance with 2 decimals (cm * 100) for mapping */
-static inline uint8_t pwm_from_distance_x100(uint32_t dist_x100)
-{
-    uint32_t d1 = (uint32_t)D1_CM * 100UL;
-    uint32_t d2 = (uint32_t)D2_CM * 100UL;
+//  IMU IMPL //not sure
+static int16_t gz_bias= 0;
+static int32_t yaw_cdeg  = 0;
+static uint8_t tilt_flag = 0u;
+ // MPU stores big indian 
+static int16_t read_word(uint8_t reg)
+{   Read_Reg(MPU_ADDR, reg);
+    uint8_t h = TWI_byte;
+    Read_Reg(MPU_ADDR,(uint8_t)(reg +1u));
+    uint8_t l = TWI_byte;
+    return (int16_t)(((uint16_t)h << 8) |(uint16_t)l);}
+void imu_init(void)
+{TWSR = 0x00u;
+    TWBR = 72u;
+    _delay_ms(150);// MPU needs time after power-on before it responds
+  Write_Reg(MPU_ADDR, REG_PWR_MGMT1,0x00u);// wake
+    _delay_ms(10);
+    Write_Reg(MPU_ADDR, REG_GYRO_CONFIG,0x00u);//+-250 deg/s
+ Write_Reg(MPU_ADDR, REG_ACCEL_CONFIG, 0x00u);//+-2g
+    _delay_ms(10);}
+void imu_calibrate(void)
+{ int32_t sum =0;
+    for (uint8_t i =0u; i <CALIB_SAMPLES; i++) {
+   sum += (int32_t)read_word(REG_GYRO_ZOUT_H);
+        _delay_ms(5);
+    }
+    gz_bias= (int16_t)(sum /(int32_t)CALIB_SAMPLES);
+    yaw_cdeg= 0;
+    tilt_flag= 0u;}
+void imu_update(uint16_t dt_ms)
+{if (dt_ms == 0u) return;
+    int16_t gz_raw =read_word(REG_GYRO_ZOUT_H);
+  int32_t gz=(int32_t)((int16_t)(gz_raw - gz_bias))*(int32_t)GYRO_SIGN;
+    yaw_cdeg+= (gz*(int32_t)dt_ms) /(int32_t)GYRO_DIV;
+  // use accel X and Y magnitude to catch if the craft tips overr
+    int16_t ax =read_word(REG_ACCEL_XOUT_H);
+ int16_t ay =read_word((uint8_t)(REG_ACCEL_XOUT_H + 2u));
+    if (ax< 0) ax= (int16_t)(-ax);
+  if (ay < 0) ay= (int16_t)(-ay);
+    tilt_flag = ((ax > (int16_t)TILT_THRESHOLD_LSB) ||   (ay > (int16_t)TILT_THRESHOLD_LSB)) ?1u : 0u;
+}
+int32_t imu_get_yaw_cdeg(void) { return yaw_cdeg; }
+void imu_reset_yaw(void){ yaw_cdeg = 0; }
+uint8_t imu_tilt_detected(void){ return tilt_flag; }
 
-    if (dist_x100 <= d1) return 0;
-    if (dist_x100 >= d2) return 255;
+// Lift Fan 
+void lift_fan_init(void)
+{LIFT_FAN_DDR  |=  (1 << LIFT_FAN_PIN);
+    LIFT_FAN_PORT &= ~(1 << LIFT_FAN_PIN);  }
+void lift_fan_on(void)  { LIFT_FAN_PORT |=  (1 << LIFT_FAN_PIN); }
+void lift_fan_off(void) { LIFT_FAN_PORT &= ~(1 << LIFT_FAN_PIN); }
 
-    return (uint8_t)((255UL * (dist_x100 - d1)) / (d2 - d1));
+// Thrust Fan 
+void thrust_fan_init(void)
+{ THRUST_FAN_DDR |= (1 << THRUST_FAN_PIN);
+    OCR0A = 0;  }
+void thrust_fan_on(void){ OCR0A = 255U; }
+void thrust_fan_off(void) { OCR0A = 0U; }
+void thrust_fan_set_speed(uint8_t pct)
+{OCR0A = (pct >= 100U) ? 255U:(uint8_t)((uint16_t)pct * 255U/100U);
+}
+//  Servo 
+static uint16_t g_servo_angle = SERVO_HOME;
+void servo_init(void)
+{ DDRB |= (1 << PB1);
+ICR1= 39999;
+ TCCR1A= (1 << COM1A1) |(1 << WGM11);
+    TCCR1B = (1 << WGM13)  |(1 << WGM12)| (1 << CS11);
+ servo_home();
+}
+void servo_set(uint16_t angle_256)
+{if (angle_256 > 512U) angle_256 = 512U;
+    int32_t ocr = 2000L
++ (int32_t)(((uint32_t)angle_256 * 2000UL)/512UL)+ (int32_t)SERVO_HOME_OFFSET;
+    if (ocr< 1000L)ocr = 1000L;
+    if (ocr > 4000L) ocr = 4000L;
+    OCR1A = (uint16_t)ocr;
+    g_servo_angle = angle_256;
 }
 
-/* ---------------- Yellow LED (PB5) ---------------- */
-static inline void YellowLED_init(void)
-{
-    DDRB  |= YELLOW_LED_MASK;
-    PORTB &= ~YELLOW_LED_MASK;
+uint16_t servo_get(void){ return g_servo_angle; }
+void servo_home(void){ servo_set(SERVO_HOME); }
+void servo_center(void){ servo_set(SERVO_CENTER); }
+
+static inline uint32_t get_tick_ms(void)
+{ uint32_t t;
+    uint8_t  s = SREG;
+    cli();
+    t = g_ms;
+SREG = s;
+    return t;
+}
+ 
+//  Forward US sens 
+
+void us_forward_init(void)
+{US_FWD_TRIG_DDR  |=  US_FWD_TRIG_MASK;
+ US_FWD_ECHO_DDR  &= ~US_FWD_ECHO_MASK;
+US_FWD_TRIG_PORT &= ~US_FWD_TRIG_MASK;
 }
 
-static inline void YellowLED_off(void)
+uint16_t us_forward_read_cm(void)
 {
-    PORTB &= ~YELLOW_LED_MASK;
+    uint32_t t0; 
+    t0 = get_tick_ms();
+    while (US_FWD_ECHO_PIN & US_FWD_ECHO_MASK) {
+        if (get_tick_ms() - t0 >= 10UL) return 0U;
+    }
+    // 10us trigger pulse
+    US_FWD_TRIG_PORT &= ~US_FWD_TRIG_MASK;
+ _delay_us(4);
+    US_FWD_TRIG_PORT |=  US_FWD_TRIG_MASK;
+  _delay_us(12);
+    US_FWD_TRIG_PORT &= ~US_FWD_TRIG_MASK;
+    // wait for echo to go high
+    t0 = get_tick_ms();
+    while (!(US_FWD_ECHO_PIN & US_FWD_ECHO_MASK)) {
+ if (get_tick_ms() - t0 >= 38UL) return 0U;
+    }
+    // snapshot TCNT1 at echo rise using timer1 ticks gives us better esolution than ms we don't reset TCNT1 so servo PWM is not effected.
+    uint8_t sreg;
+    uint16_t t_start, t_end;
+    sreg= SREG; cli(); t_start = TCNT1; SREG = sreg;
+    
+    t0 = get_tick_ms();
+    while (US_FWD_ECHO_PIN & US_FWD_ECHO_MASK) {
+        sreg = SREG; cli(); t_end = TCNT1; SREG = sreg;
+        if ((uint16_t)(t_end - t_start) > 23200U) { _delay_ms(5); return 400U; }
+        if (get_tick_ms() - t0 >= 38UL) return 0U;
+    }
+
+    sreg = SREG; cli(); t_end = TCNT1; SREG = sreg;
+    uint16_t dist_cm = (t_end - t_start) / 116U;
+    _delay_ms(60); 
+    return dist_cm;
+}
+uint8_t us_forward_wall_detected(void)
+{
+    uint16_t d = us_forward_read_cm();
+    return (d > 0U && d < US_FWD_TURN_THRESHOLD_CM) ? 1U : 0U;
+}
+uint8_t us_forward_get_turn_direction(uint16_t left_cm, uint16_t right_cm)
+{
+    return (left_cm > right_cm) ? 1U : 2U;
 }
 
-static inline void YellowLED_toggle(void)
+//  Left Ultrasonic US 
+//ask caline
+void us_left_init(void)
+{US_LEFT_TRIG_DDR  |=  US_LEFT_TRIG_MASK;
+   US_LEFT_ECHO_DDR  &= ~US_LEFT_ECHO_MASK;
+    US_LEFT_TRIG_PORT &= ~US_LEFT_TRIG_MASK;
+}
+uint16_t us_left_read_cm(void)
 {
-    PINB = YELLOW_LED_MASK; // hardware toggle
+    uint32_t t0;
+
+    t0 = get_tick_ms();
+    while (US_LEFT_ECHO_PIN & US_LEFT_ECHO_MASK) {
+        if (get_tick_ms() - t0 >= 10UL) return 0U;
+    }
+
+  US_LEFT_TRIG_PORT &= ~US_LEFT_TRIG_MASK;
+    _delay_us(4);
+ US_LEFT_TRIG_PORT |=  US_LEFT_TRIG_MASK;
+    _delay_us(12);
+ US_LEFT_TRIG_PORT &= ~US_LEFT_TRIG_MASK;
+
+    t0 = get_tick_ms();
+    while (!(US_LEFT_ECHO_PIN & US_LEFT_ECHO_MASK)) {
+        if (get_tick_ms() - t0 >= 38UL) return 0U;}
+    uint8_t  sreg;
+    uint16_t t_start, t_end;
+    sreg    = SREG; cli(); t_start = TCNT1; SREG = sreg;
+    t0 = get_tick_ms();
+    while (US_LEFT_ECHO_PIN & US_LEFT_ECHO_MASK) {
+        sreg = SREG; cli(); t_end = TCNT1; SREG = sreg;
+        if ((uint16_t)(t_end - t_start) > 23200U) { _delay_ms(5); return 400U; }
+        if (get_tick_ms() - t0 >= 38UL) return 0U;
+    }
+    sreg = SREG; cli(); t_end = TCNT1; SREG = sreg;
+
+    uint16_t dist_cm = (uint16_t)(t_end - t_start) / 116U;
+    _delay_ms(60);
+    return dist_cm;
+}
+//  Upward  
+
+static uint8_t g_up_confirm = 0U;
+
+void us_upward_init(void)
+{
+  US_UP_TRIG_DDR  |=  US_UP_TRIG_MASK;
+US_UP_ECHO_DDR  &= ~US_UP_ECHO_MASK;
+  US_UP_TRIG_PORT &= ~US_UP_TRIG_MASK;
 }
 
-/* ---------------- UART helpers ---------------- */
-static inline void UART_init(uint16_t ubrr)
-{
-    UBRR0H = (uint8_t)(ubrr >> 8);
-    UBRR0L = (uint8_t)(ubrr);
-    UCSR0B = (1 << RXEN0) | (1 << TXEN0);
-    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00); // 8N1
+uint16_t us_upward_read_cm(void)
+{  uint32_t t0;
+
+t0 = get_tick_ms();
+    while (US_UP_ECHO_PIN & US_UP_ECHO_MASK) {
+        if (get_tick_ms() - t0 >= 10UL) return 0U;
+    }
+
+   US_UP_TRIG_PORT &= ~US_UP_TRIG_MASK;
+    _delay_us(4);
+ US_UP_TRIG_PORT |=  US_UP_TRIG_MASK;
+    _delay_us(12);
+US_UP_TRIG_PORT &= ~US_UP_TRIG_MASK;
+
+ t0 = get_tick_ms();
+    while (!(US_UP_ECHO_PIN & US_UP_ECHO_MASK)) {
+        if (get_tick_ms() - t0 >= 38UL) return 0U;
+    }
+  uint8_t  sreg;
+ uint16_t t_start, t_end;
+    sreg    = SREG; cli(); t_start = TCNT1; SREG = sreg;
+
+  t0 = get_tick_ms();
+    while (US_UP_ECHO_PIN & US_UP_ECHO_MASK) {
+        sreg = SREG; cli(); t_end = TCNT1; SREG = sreg;
+     if ((uint16_t)(t_end -t_start) > 23200U) { _delay_ms(5); return 400U;}
+    if (get_tick_ms() - t0 >= 38UL) return 0U;
+    }
+    sreg = SREG; cli(); t_end = TCNT1; SREG = sreg;
+    uint16_t dist_cm = (t_end - t_start) / 116U;
+    _delay_ms(60);
+    return dist_cm;
 }
-
-static inline void UART_transmit(uint8_t data)
+uint8_t us_upward_bar_detected(void)
 {
-    while (!(UCSR0A & (1 << UDRE0))) { }
-    UDR0 = data;
+uint16_t dist = us_upward_read_cm();
+    if (dist > 0U && dist <US_UP_BAR_THRESHOLD_CM) {
+        g_up_confirm++;
+        if (g_up_confirm >= US_UP_CONFIRM_COUNT) {g_up_confirm = US_UP_CONFIRM_COUNT;
+            return 1U;
+        }
+    } else {
+        g_up_confirm = 0U;
+    }
+    return 0U;
 }
+//  IR Sensor 
 
-static inline void UART_printString(const char* str)
+static uint8_t g_ir_confirm = 0U;
+void ir_sensor_init(void)
 {
-    while (*str) UART_transmit((uint8_t)*str++);
-}
-
-static inline void UART_printU16(uint16_t num)
-{
-    char buf[6];
-    utoa(num, buf, 10);
-    UART_printString(buf);
-}
-
-static inline void UART_printU32(uint32_t num)
-{
-    char buf[11];
-    ultoa(num, buf, 10);
-    UART_printString(buf);
-}
-
-/* Print distance in cm with 2 decimals from cm*100 */
-static inline void UART_printDistance_x100(uint32_t dist_x100)
-{
-    uint16_t integer_part = (uint16_t)(dist_x100 / 100UL);
-    uint16_t decimal_part = (uint16_t)(dist_x100 % 100UL);
-
-    UART_printU16(integer_part);
-    UART_transmit('.');
-    if (decimal_part < 10) UART_transmit('0');
-    UART_printU16(decimal_part);
-}
-
-/* ---------------- ADC (IR) ----------------
-   External AREF selected (REFS=00).
-   With Vref=2.0V provided on AREF, ADC=1023 -> 2.0V. */
-static inline void ADC_init(void)
-{
-    ADMUX  = 0x00; // External AREF, right adjust
-    ADCSRA = (1 << ADEN) |
-             (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // prescaler 128
-}
-
-static inline uint16_t ADC_read(uint8_t channel)
-{
-    channel &= 0x07;
-    ADMUX = (ADMUX & 0xF8) | channel;
-
+    ADMUX  = (IR_ADC_CH & 0x07U);
+    ADCSRA = (1 << ADEN)
+           | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);  // /128 = 125 kHz ADC clock
     ADCSRA |= (1 << ADSC);
-    while (ADCSRA & (1 << ADSC)) { }
-
+    while (ADCSRA & (1 << ADSC)) {}
+}
+uint16_t ir_sensor_read(void)
+{ADCSRA |= (1 << ADSC);
+    while (ADCSRA & (1 << ADSC)) {}
     return ADC;
 }
-
-/* IR conversion returning cm*100 (2 decimals), no float */
-static inline uint32_t IR_adc_to_distance_x100(uint16_t raw_adc)
+uint8_t ir_bar_detected(void)
 {
-    if (raw_adc <= (uint16_t)(CALIB_C + 1)) return 8000; // 80.00 cm
-    if (raw_adc > 1000)                     return 900;  // 9.00 cm
-
-    // distance_cm = K / (adc - C)
-    // distance_x100 = (K*100) / (adc - C)
-    return (uint32_t)(CALIB_K * 100UL) / (uint32_t)(raw_adc - CALIB_C);
-}
-
-/* ---------------- Ultrasonic (Timer1) ---------------- */
-static inline void Ultrasonic_init(void)
-{
-    DDRB |= US_TRIG_MASK;   // PB3 TRIG output
-    DDRD &= ~US_ECHO_MASK;  // PD2 ECHO input
-
-    // Timer1 prescaler 8 => tick = 0.5us
-    TCCR1A = 0;
-    TCCR1B = (1 << CS11);
-}
-
-/* Returns distance in cm*100, writes raw timer ticks to *raw_ticks */
-static inline uint32_t Measure_Ultrasonic_Distance_x100(uint16_t *raw_ticks)
-{
-    // Trigger 10us pulse
-    PORTB &= ~US_TRIG_MASK;
-    _delay_us(2);
-    PORTB |= US_TRIG_MASK;
-    _delay_us(10);
-    PORTB &= ~US_TRIG_MASK;
-
-    // Wait for ECHO high (timeout)
-    int32_t timeout = 60000;
-    while (!(PIND & US_ECHO_MASK)) {
-        if (--timeout == 0) {
-            *raw_ticks = 0;
-            return 0;
-        }
+    uint16_t val = ir_sensor_read();
+    if (val < IR_BAR_THRESHOLD) {
+        g_ir_confirm++;
+        if (g_ir_confirm >= IR_CONFIRM_COUNT) {
+g_ir_confirm = IR_CONFIRM_COUNT;
+return 1U;  }
+    } else {
+g_ir_confirm = 0U;
     }
-
-    uint8_t sreg = SREG;
-    cli();
-
-    TCNT1 = 0;
-
-    // Measure width while ECHO high, with safety cap
-    while (PIND & US_ECHO_MASK) {
-        if (TCNT1 > 60000) {
-            uint16_t t = TCNT1;
-            SREG = sreg;
-            *raw_ticks = t;
-            return 40000; // 400.00 cm (cap)
-        }
-    }
-
-    uint16_t ticks = TCNT1;
-    SREG = sreg;
-
-    *raw_ticks = ticks;
-
-    // ticks are 0.5us each => time_us = ticks/2
-    // distance_cm = time_us / 58 = (ticks/2)/58 = ticks/116
-    // distance_x100 = (ticks * 100) / 116
-    return (uint32_t)(ticks * 100UL) / 116UL;
+    return 0U;
+}
+//  UART 
+static void uart_init(void)
+{
+  UBRR0H =(uint8_t)(MYUBRR >> 8);
+ UBRR0L= (uint8_t)(MYUBRR);
+ UCSR0B =(1 << TXEN0);
+ UCSR0C =(1 << UCSZ01) |(1 << UCSZ00);  
+}
+static void uart_tx(uint8_t c)    { while (!(UCSR0A & (1 << UDRE0))) {} UDR0 = c; }
+static void uart_str(const char *s) { while (*s) uart_tx((uint8_t)*s++); }
+static void uart_u16(uint16_t n){ char b[6];  utoa(n, b, 10);  uart_str(b); }
+static void uart_i32(int32_t  n)
+{if (n <0) { uart_tx('-'); n = -n; }
+    char b[12]; ltoa(n, b, 10); uart_str(b);
+}
+static int16_t clamp16f(float v, float lo, float hi)
+{if (v <lo) v = lo;
+if (v > hi) v = hi;
+ return (int16_t)v;
+}
+static void pid_reset(float *integral, float *prev_err)
+{ *integral = 0.0f; *prev_err = 0.0f;
+}
+static uint8_t thrust_from_distance(uint16_t fwd_cm)
+{ if (fwd_cm == 0U ||fwd_cm >= THRUST_FULL_CM) return THRUST_FULL_PCT;
+    if (fwd_cm <= WALL_THRESHOLD_CM)return THRUST_MIN_PCT;
+    uint16_t span= THRUST_FULL_CM - WALL_THRESHOLD_CM;
+   uint16_t dist_in= fwd_cm - WALL_THRESHOLD_CM;
+    uint8_t  pct_span = THRUST_FULL_PCT - THRUST_MIN_PCT;
+    return (uint8_t)(THRUST_MIN_PCT + (uint16_t)(dist_in * pct_span) /span);
 }
 
-/* ---------------- Setup / Loop ---------------- */
-static inline void setup(void)
+//  Main 
+static void hovercraft_main(void)
 {
-    UART_init((uint16_t)MYUBRR);
-    ADC_init();
-    Ultrasonic_init();
-
-    PWM_D3_init();        // D3 brightness (OC2B)
-    YellowLED_init();     // PB5 blink (L)
-    Timer0_init_1ms();    // millis timebase
-
+ timer0_init();
+ uart_init();
+lift_fan_init();
+    servo_init();
+ thrust_fan_init();
+    us_forward_init();
+    us_left_init();
+ imu_init();
     sei();
+    lift_fan_on();
+    uart_str("  ENGR290  #11 Competition WOOHOOOOOOOOOO  \r\n");
+    servo_home();
+    g_state = STATE_HOVER_UP;
+    uint32_t state_entry_ms = sys_millis();
+    uint32_t prev_ms= state_entry_ms;
 
-    UART_printString("System Initialized.\r\n");
-}
+    float yaw_integral = 0.0f;
+    float yaw_prev_err = 0.0f;
+    uart_str("[INIT ] Lift fan ON waiting for air cushion\r\n");
 
-static inline void loop(void)
-{
-    static uint32_t last_sample_ms = 0;
-    static uint32_t last_blink_ms  = 0;
-    static uint8_t  outside_range  = 0;
+    while (1)//always trye
+    {  lift_fan_on();  // t makes sure lift never drops mid-run
+        uint32_t now= sys_millis();
+        uint16_t dt_ms = (uint16_t)(now -prev_ms);
+        prev_ms= now;
+        switch (g_state)
+        {
+            case STATE_HOVER_UP:
+                // wait for the air to build upthen calibrate
+                if (now - state_entry_ms >= HOVER_SPINUP_MS) {
+                    uart_str("[INIT ]  Calibrating gyro hold still...\r\n");
+                    imu_calibrate();
+                   imu_reset_yaw();
+                 pid_reset(&yaw_integral, &yaw_prev_err);
+                   servo_home();
+                thrust_fan_on();
+                    g_state= STATE_DRIVE;
+                    state_entry_ms = sys_millis();
+                  prev_ms= state_entry_ms;
+                  uart_str("[STATE]  DRIVE  thrust ON\r\n");
+                }
+                break;
+            case STATE_DRIVE:
+            {
+                imu_update(dt_ms);
+                uint16_t fwd = us_forward_read_cm();
+               uint16_t lt= us_left_read_cm();
+               int32_t  yaw =imu_get_yaw_cdeg();
+                float err  =(float)yaw /100.0f;
+                float dt_s =(float)dt_ms /1000.0f;
+             yaw_integral += err *dt_s;
+                if (yaw_integral> YAW_INTEGRAL_CAP) yaw_integral =YAW_INTEGRAL_CAP;
+                if (yaw_integral < -YAW_INTEGRAL_CAP) yaw_integral= -YAW_INTEGRAL_CAP;
+                float deriv = (dt_ms > 0u) ? (err - yaw_prev_err) /dt_s : 0.0f;
+                float pid_out = YAW_KP * err + YAW_KI * yaw_integral +YAW_KD * deriv;
+                yaw_prev_err = err;
+                int16_t corr = clamp16f(pid_out,             -(float)YAW_MAX_CORR,
+                                  (float)YAW_MAX_CORR);
+                servo_set((uint16_t)((int16_t)SERVO_HOME + corr));
+                if (imu_tilt_detected())
+                    uart_str("[WARN ]  TILT detected craft not level!\r\n");
+                uint8_t tpct = thrust_from_distance(fwd); 
+                thrust_fan_set_speed(tpct);
+              uart_str("[DRIVE]  FWD:"); 
+                uart_u16(fwd); uart_str("cm");
+              uart_str(fwd <= WALL_THRESHOLD_CM ? "[WALL]" : "      ");
+                uart_str("  LT:");
+                uart_u16(lt);  uart_str("cm");
+            uart_str(lt > US_LEFT_OPEN_CM ? "[OPEN]": "[WALL]");
+                uart_str("  YAW:");
+               uart_i32(yaw); uart_str("cd");
+                uart_str("  CORR:");
+                uart_i32((int32_t)corr);
+                uart_str("  THR:");
+                uart_u16(tpct); uart_str("%\r\n");
+                // wall ahead se left sensor to pick which way to turn
+                if (fwd> 0U && fwd <= WALL_THRESHOLD_CM) {
+                    imu_reset_yaw();
+                    pid_reset(&yaw_integral, &yaw_prev_err);
+                    if (lt > US_LEFT_OPEN_CM) {
+                      g_state = STATE_TURN_LEFT;
+                        uart_str("[STATE]  TURN_LEFT\r\n");
+                    } else {g_state = STATE_TURN_RIGHT;
+                        uart_str("[STATE]  TURN_RIGHT\r\n");
+                    }
+                    state_entry_ms = sys_millis();
+                    prev_ms= state_entry_ms;
+                }
+                break;
+            }
+            case STATE_TURN_LEFT:
+            {
+        imu_update(dt_ms);
+              servo_set(SERVO_LEFT);
+                thrust_fan_on();
+                int32_t  yaw= imu_get_yaw_cdeg();
+              uint32_t elapsed = now - state_entry_ms;
+              uart_str("[TURN ]  LEFT  yaw:");
+                uart_i32(yaw);
+              uart_str("cd  t:");
+                uart_u16((uint16_t)elapsed);
+               uart_str("ms\r\n");
+                uint8_t imu_done = (yaw  >= (int32_t)(TURN_TARGET_CDEG -TURN_DONE_TOL_CDEG));
+                uint8_t time_done = (elapsed >= TURN_TIMEOUT_MS);
+                if (imu_done ||time_done) {
+                    if (time_done && !imu_done)
+                        uart_str("[WARN ]  Turn timed out (IMU  failed)\r\n");
+                    thrust_fan_off();
+                    delay_ms_nb(150);  //short pause to let craft settle before driving 
+                    servo_home();
+                  imu_reset_yaw();
+                    pid_reset(&yaw_integral, &yaw_prev_err);
+                    thrust_fan_on();
+                    g_state= STATE_DRIVE;
+                    state_entry_ms = sys_millis();
+                    prev_ms= state_entry_ms;
+                    uart_str("[STATE]  DRIVE\r\n");
+                }
+                break;}
+            case STATE_TURN_RIGHT:
+            {imu_update(dt_ms);
+                servo_set(SERVO_RIGHT);
+                thrust_fan_on();
+                int32_t  yaw= imu_get_yaw_cdeg();
+                uint32_t elapsed =now -state_entry_ms;
+                uart_str("[TURN ]  RIGHT yaw:");
+                uart_i32(yaw);
+                uart_str("cd  t:");
+                uart_u16((uint16_t)elapsed);
+                uart_str("ms\r\n");
 
-    uint32_t now = sys_millis();
-
-    if (now - last_sample_ms >= SAMPLE_PERIOD_MS) {
-        last_sample_ms = now;
-
-        if (sensor_mode == IR_MODE) {
-            uint16_t raw_adc    = ADC_read(IR_ADC_CH);
-            uint32_t dist_x100  = IR_adc_to_distance_x100(raw_adc);
-            uint8_t  duty       = pwm_from_distance_x100(dist_x100);
-
-            PWM_D3_set(duty);
-
-            UART_printString("IR | ADC=");
-            UART_printU16(raw_adc);
-            UART_printString(" | Dist=");
-            UART_printDistance_x100(dist_x100);
-            UART_printString(" cm | PWM=");
-            UART_printU16(duty);
-            UART_printString("\r\n");
-
-            // range check uses cm*100
-            outside_range = (dist_x100 < (uint32_t)D1_CM * 100UL) ||
-                            (dist_x100 > (uint32_t)D2_CM * 100UL);
-
-        } else { // US_MODE
-            uint16_t raw_ticks  = 0;
-            uint32_t dist_x100  = Measure_Ultrasonic_Distance_x100(&raw_ticks);
-            uint8_t  duty       = pwm_from_distance_x100(dist_x100);
-
-            PWM_D3_set(duty);
-
-            UART_printString("US | ticks=");
-            UART_printU16(raw_ticks);
-            UART_printString(" | Dist=");
-            UART_printDistance_x100(dist_x100);
-            UART_printString(" cm | PWM=");
-            UART_printU16(duty);
-            UART_printString("\r\n");
-
-            outside_range = (dist_x100 < (uint32_t)D1_CM * 100UL) ||
-                            (dist_x100 > (uint32_t)D2_CM * 100UL);
+                uint8_t imu_done = (yaw <=-(int32_t)(TURN_TARGET_CDEG- TURN_DONE_TOL_CDEG));
+                uint8_t time_done = (elapsed >= TURN_TIMEOUT_MS);
+                if (imu_done||time_done) {
+                    if (time_done && !imu_done)
+          uart_str("[WARN ]  Turn timed out (IMU may have failed)\r\n");
+                    thrust_fan_off();
+                   delay_ms_nb(150);
+                servo_home();
+                   imu_reset_yaw();
+                   pid_reset(&yaw_integral, &yaw_prev_err);
+                   thrust_fan_on();
+                  g_state= STATE_DRIVE;
+                    state_entry_ms = sys_millis();
+                    prev_ms= state_entry_ms;
+                uart_str("[STATE]  DRIVE\r\n");
+                }
+                break;
+            }
         }
-
-        // If inside range, force LED off and reset blink timing
-        if (!outside_range) {
-            YellowLED_off();
-            last_blink_ms = now;
-        }
-    }
-
-    // Blink at 1s period (toggle every 500ms) when outside range
-    if (outside_range && (now - last_blink_ms >= BLINK_HALF_PERIOD_MS)) {
-        last_blink_ms = now;
-        YellowLED_toggle();
     }
 }
 
-int main(void)
-{
-    setup();
-    while (1) {
-        loop();
-    }
+void setup()
+{  hovercraft_main();
 }
+
+void loop()
+{}
